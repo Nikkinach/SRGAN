@@ -29,7 +29,7 @@ def train_srgan_improved():
     lr_gen = 1e-4
     lr_disc = 1e-4
     lambda_content = 1.0
-    lambda_adv = 5e-5  # smaller to avoid discriminator collapse
+    lambda_adv = 1e-2  # Hinge loss allows stronger weight
 
     # Data
     train_set = DIV2KDataset(dataset_path, mode='train')
@@ -42,14 +42,12 @@ def train_srgan_improved():
     generator = GeneratorRRDB().to(device)
     discriminator = Discriminator().to(device)
     vgg = VGGFeatureExtractor().to(device)
-
     generator.load_state_dict(torch.load(pretrain_path, map_location=device))
 
     # Loss functions and optimizers
     pixel_loss = CharbonnierLoss()
-    adversarial_loss = nn.BCEWithLogitsLoss()
-    optimizer_G = optim.AdamW(generator.parameters(), lr=lr_gen)
-    optimizer_D = optim.AdamW(discriminator.parameters(), lr=lr_disc)
+    optimizer_G = torch.optim.AdamW(generator.parameters(), lr=lr_gen)
+    optimizer_D = torch.optim.AdamW(discriminator.parameters(), lr=lr_disc)
     scheduler_G = CosineAnnealingLR(optimizer_G, T_max=num_epochs)
     scheduler_D = CosineAnnealingLR(optimizer_D, T_max=num_epochs)
 
@@ -63,32 +61,38 @@ def train_srgan_improved():
 
         for lr_imgs, hr_imgs in progress_bar:
             lr_imgs, hr_imgs = lr_imgs.to(device), hr_imgs.to(device)
-            valid = torch.ones((lr_imgs.size(0), 1), device=device)
-            fake = torch.zeros((lr_imgs.size(0), 1), device=device)
 
-            # Train Generator
+            # ----------- Generator Update -----------
             optimizer_G.zero_grad()
             with autocast("cuda"):
                 gen_hr = generator(lr_imgs)
+                pred_fake = discriminator(gen_hr)
+                pred_real = discriminator(hr_imgs).detach()
+
+                # Hinge RaGAN adversarial loss
+                g_adv_loss = -torch.mean(pred_real - pred_fake)
+
+                # Content loss
                 real_feat = vgg(hr_imgs).detach()
                 fake_feat = vgg(gen_hr)
                 content_loss = pixel_loss(fake_feat, real_feat)
-                pred_fake = discriminator(gen_hr)
-                pred_real = discriminator(hr_imgs).detach()
-                gan_loss = adversarial_loss(pred_fake - pred_real.mean(0, keepdim=True), valid)
-                g_loss = lambda_content * content_loss + lambda_adv * gan_loss
+
+                g_loss = lambda_content * content_loss + lambda_adv * g_adv_loss
+
             scaler.scale(g_loss).backward()
             scaler.step(optimizer_G)
 
-            # Train Discriminator
+            # ----------- Discriminator Update -----------
             optimizer_D.zero_grad()
             with autocast("cuda"):
                 pred_real = discriminator(hr_imgs)
                 pred_fake = discriminator(gen_hr.detach())
-                d_loss_real = adversarial_loss(pred_real - pred_fake.mean(0, keepdim=True), valid)
-                d_loss_fake = adversarial_loss(pred_fake - pred_real.mean(0, keepdim=True), fake)
+
+                # RaGAN Hinge Loss
+                d_loss_real = torch.mean(torch.relu(1.0 - (pred_real - pred_fake)))
+                d_loss_fake = torch.mean(torch.relu(1.0 + (pred_fake - pred_real)))
                 d_loss = (d_loss_real + d_loss_fake) / 2
-                d_loss = torch.clamp(d_loss, 0, 1)
+
             scaler.scale(d_loss).backward()
             scaler.step(optimizer_D)
             scaler.update()
@@ -99,7 +103,7 @@ def train_srgan_improved():
         scheduler_D.step()
         torch.save(generator.state_dict(), os.path.join(save_model_path, f"gen_epoch_{epoch+1}.pth"))
 
-        # Validation
+        # ----------- Validation -----------
         generator.eval()
         avg_psnr, avg_ssim = 0, 0
         with torch.no_grad():
