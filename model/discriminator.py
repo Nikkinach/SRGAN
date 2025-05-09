@@ -31,6 +31,4 @@ class Discriminator(nn.Module):
 
     def forward(self, x):
         out = self.model(x)
-        if self.clip_value is not None:
-            out = torch.clamp(out, -self.clip_value, self.clip_value)
         return out
